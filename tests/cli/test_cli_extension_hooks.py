@@ -84,14 +84,13 @@ class TestExtensionHookDefaults:
             image_bar="image-bar",
             input_area="input-area",
             input_rule_bot="bottom-rule",
-            voice_status_bar="voice-status",
             completions_menu="completions-menu",
         )
         # First element is Window(height=0), rest are the named widgets
         assert children[1:] == [
             "sudo", "secret", "approval", "clarify", "spinner",
             "spacer", "status", "top-rule", "image-bar", "input-area",
-            "bottom-rule", "voice-status", "completions-menu",
+            "bottom-rule", "completions-menu",
         ]
 
 
@@ -113,7 +112,6 @@ class TestExtensionHookSubclass:
             image_bar="image-bar",
             input_area="input-area",
             input_rule_bot="bottom-rule",
-            voice_status_bar="voice-status",
             completions_menu="completions-menu",
         )
         # Extra widgets should appear between spacer and status bar

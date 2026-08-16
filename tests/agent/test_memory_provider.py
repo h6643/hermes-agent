@@ -313,22 +313,19 @@ class TestMemoryManager:
 
 
 class TestPluginMemoryDiscovery:
-    """Memory providers are discovered from plugins/memory/ directory."""
+    """Memory providers are NOT bundled — discovered only from user plugins dir."""
 
-    def test_discover_finds_providers(self):
-        """discover_memory_providers returns available providers."""
+    def test_bundled_providers_not_discovered(self):
+        """No user plugins dir → discover finds nothing (bundled excluded)."""
         from plugins.memory import discover_memory_providers
         providers = discover_memory_providers()
         names = [name for name, _, _ in providers]
-        assert "holographic" in names  # always available (no external deps)
+        assert "holographic" not in names  # bundled providers are not shipped
 
-    def test_load_provider_by_name(self):
-        """load_memory_provider returns a working provider instance."""
+    def test_load_uninstalled_returns_none(self):
+        """Bundled provider without user install loads as None."""
         from plugins.memory import load_memory_provider
-        p = load_memory_provider("holographic")
-        assert p is not None
-        assert p.name == "holographic"
-        assert p.is_available()
+        assert load_memory_provider("holographic") is None
 
     def test_load_nonexistent_returns_none(self):
         """load_memory_provider returns None for unknown names."""
@@ -378,10 +375,10 @@ class TestUserInstalledProviderDiscovery:
         assert p.name == "myexternal"
         assert p.is_available()
 
-    def test_bundled_takes_precedence(self, tmp_path, monkeypatch):
-        """Bundled provider wins when user plugin has the same name."""
+    def test_user_plugin_is_the_only_source(self, tmp_path, monkeypatch):
+        """外置记忆 Provider 不内置：同名 provider 只从用户安装目录加载（无 bundled 覆盖）。"""
         from plugins.memory import load_memory_provider, discover_memory_providers
-        # Create user plugin named "holographic" (same as bundled)
+        # Create a user plugin named "holographic" (bundled one is not shipped)
         plugin_dir = tmp_path / "plugins" / "holographic"
         plugin_dir.mkdir(parents=True)
         (plugin_dir / "__init__.py").write_text(
@@ -399,12 +396,12 @@ class TestUserInstalledProviderDiscovery:
             "plugins.memory._get_user_plugins_dir",
             lambda: tmp_path / "plugins",
         )
-        # Load should return bundled (name "holographic"), not user (name "holographic-FAKE")
+        # Load returns the user plugin (bundled is excluded from discovery)
         p = load_memory_provider("holographic")
         assert p is not None
-        assert p.name == "holographic"  # bundled wins
+        assert p.name == "holographic-FAKE"
 
-        # discover should not duplicate
+        # discover finds it exactly once
         providers = discover_memory_providers()
         holo_count = sum(1 for n, _, _ in providers if n == "holographic")
         assert holo_count == 1

@@ -1,10 +1,27 @@
 """Tests for Hindsight's declared config surface."""
 
+from pathlib import Path
+
+import pytest
+
 from plugins.memory.config_schema import (
     KIND_SECRET,
     KIND_SELECT,
     get_provider_config_schema,
 )
+
+_REPO_PLUGINS = Path(__file__).resolve().parents[3] / "plugins" / "memory"
+
+
+@pytest.fixture(autouse=True)
+def _point_discovery_at_repo_source(monkeypatch):
+    """外置记忆 Provider 不内置：运行时只扫用户安装目录。schema 测试校验的是
+    repo 源码里的声明文件，与发布包是否内置无关，直接把 find_provider_dir 指回
+    repo 的 plugins/memory/。"""
+    monkeypatch.setattr(
+        "plugins.memory.find_provider_dir",
+        lambda name: (_REPO_PLUGINS / name) if (_REPO_PLUGINS / name / "__init__.py").exists() else None,
+    )
 
 
 def test_hindsight_is_declared():

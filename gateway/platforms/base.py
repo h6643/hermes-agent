@@ -190,32 +190,6 @@ def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bo
     return True
 
 
-def build_auto_tts_output_path(platform) -> str:
-    """Return a unique temp output path for gateway auto-TTS synthesis.
-
-    Platform-awareness lives HERE (the caller knows its platform), not in the
-    TTS tool's ``HERMES_SESSION_PLATFORM`` contextvar — that contextvar is
-    cleared by ``_clear_session_env`` before the post-handler auto-TTS block
-    in ``BasePlatformAdapter`` runs, so relying on it always produced MP3
-    (#57049, #36685). Platforms whose native voice bubbles require Ogg/Opus
-    (``tools.tts_tool.OPUS_VOICE_PLATFORMS`` — the single source of truth)
-    get an explicit ``.ogg`` path; the tool's central container repair
-    (``_repair_ogg_container``) then guarantees real Ogg/Opus bytes for every
-    provider, including MP3-only backends like Edge TTS. Everything else
-    keeps the MP3 default.
-    """
-    from tools.tts_tool import OPUS_VOICE_PLATFORMS
-
-    ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
-    audio_path = os.path.join(
-        tempfile.gettempdir(),
-        "hermes_voice",
-        f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}",
-    )
-    os.makedirs(os.path.dirname(audio_path), exist_ok=True)
-    return audio_path
-
-
 def utf16_len(s: str) -> int:
     """Count UTF-16 code units in *s*.
 
@@ -584,75 +558,6 @@ if TYPE_CHECKING:
     from agent.display import ToolPreview
 
 
-# ---------------------------------------------------------------------------
-# Streaming TTS format descriptor and handle (#60671)
-# ---------------------------------------------------------------------------
-
-@dataclass
-class AudioFormat:
-    """Declared PCM format for a streaming-TTS session.
-
-    All chunks delivered via ``write_streaming_tts`` must conform to this
-    format: raw little-endian PCM at the declared sample rate, channels,
-    and sample width.
-    """
-    sample_rate: int = 24000
-    channels: int = 1
-    sample_width: int = 2  # bytes per sample (int16 = 2)
-
-
-@dataclass
-class StreamingTTSHandle:
-    """Opaque handle returned by ``begin_streaming_tts``.
-
-    Adapters may subclass or extend this with platform-specific state
-    (track IDs, buffers, etc.).  The base fields are used by the consumer
-    for bookkeeping and cancellation.
-    """
-    chat_id: str = ""
-    audio_format: AudioFormat = field(default_factory=AudioFormat)
-    # Set to True after the first PCM chunk has been written (audible output
-    # has started).  The consumer uses this to decide whether a failure
-    # should fall back to whole-file TTS (not yet audible) or just end
-    # cleanly (already audible — don't replay from the beginning).
-    audible: bool = False
-    # Set to True by abort_streaming_tts; late chunks are dropped.
-    aborted: bool = False
-
-
-def streaming_tts_turn_key(session_key: str | None, turn_marker: Any = None, *, event: Any = None) -> str | None:
-    """Return a per-turn streaming-TTS suppression key.
-
-    The key is intentionally turn-scoped, not chat-scoped, so overlapping
-    turns in the same chat cannot suppress each other's fallback paths.
-    ``turn_marker`` is usually the gateway run generation; if that is absent
-    we fall back to the current event's message/update identifiers.
-    """
-    if not session_key:
-        return None
-    if turn_marker is None and event is not None:
-        turn_marker = getattr(event, "message_id", None) or getattr(event, "platform_update_id", None)
-    if turn_marker is None:
-        return None
-    return f"{session_key}:{turn_marker}"
-
-
-def streaming_tts_should_skip_whole_file(
-    completed_turns: set[str],
-    session_key: str | None,
-    turn_marker: Any = None,
-    *,
-    event: Any = None,
-) -> bool:
-    """Pure helper used by the auto-TTS suppression path.
-
-    Keeps the suppression decision turn-scoped and testable without
-    exercising the whole adapter method stack.
-    """
-    turn_key = streaming_tts_turn_key(session_key, turn_marker, event=event)
-    return bool(turn_key and turn_key in completed_turns)
-
-
 GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
     "Secure secret entry is not supported over messaging. "
     "Load this skill in the local CLI to be prompted, or add the key to ~/.hermes/.env manually."
@@ -994,8 +899,7 @@ def _sniff_audio_ext(data: bytes, fallback_ext: str) -> str:
     """Prefer a container-matching extension when audio magic bytes are obvious.
 
     Thin wrapper around the shared sniffer in ``tools.audio_container`` —
-    ONE module owns container detection for both the outbound TTS repair
-    (``tools/tts_tool.py``) and this inbound cache path.
+    ONE module owns container detection for the inbound audio cache path.
     """
     from tools.audio_container import sniff_audio_ext
 
@@ -3082,26 +2986,6 @@ class BasePlatformAdapter(ABC):
         # mitigating indirect prompt injection from third parties in a shared
         # thread/channel.
         self._authorization_check: Optional[Callable[[str, Optional[str], Optional[str]], bool]] = None
-        # Auto-TTS on voice input: ``_auto_tts_default`` is the global default
-        # (``voice.auto_tts`` in config.yaml, pushed by GatewayRunner on connect).
-        # Per-chat overrides live in two sets populated from ``_voice_mode``:
-        #   - ``_auto_tts_enabled_chats``: chat explicitly opted in via ``/voice on``
-        #     or ``/voice tts`` (mode is ``voice_only`` or ``all``). Fires even when
-        #     the global default is False.
-        #   - ``_auto_tts_disabled_chats``: chat explicitly opted out via
-        #     ``/voice off`` (mode is ``off``). Suppresses auto-TTS even when the
-        #     global default is True.
-        # The gate in _process_message() is:
-        #   fire if chat in _auto_tts_enabled_chats
-        #     OR (_auto_tts_default and chat not in _auto_tts_disabled_chats)
-        self._auto_tts_default: bool = False
-        self._auto_tts_enabled_chats: set = set()
-        self._auto_tts_disabled_chats: set = set()
-        # Per-turn streaming-TTS completion flag (#60671).  When the gateway
-        # streaming-TTS consumer successfully delivers audio, it adds the
-        # turn key here so the base adapter's whole-file auto-TTS path skips
-        # the duplicate.  Cleared after the turn completes.
-        self._streaming_tts_completed_turns: set[str] = set()
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
@@ -3401,21 +3285,6 @@ class BasePlatformAdapter(ABC):
     @property
     def fatal_error_retryable(self) -> bool:
         return self._fatal_error_retryable
-
-    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
-        """Whether auto-TTS on voice input should fire for ``chat_id``.
-
-        Decision layers (Issue #16007):
-          1. Explicit ``/voice on`` or ``/voice tts`` → always fire (even if
-             ``voice.auto_tts`` is False).
-          2. Explicit ``/voice off`` → never fire.
-          3. Fall back to the global ``voice.auto_tts`` config default.
-        """
-        if chat_id in self._auto_tts_enabled_chats:
-            return True
-        if chat_id in self._auto_tts_disabled_chats:
-            return False
-        return bool(self._auto_tts_default)
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
@@ -3751,10 +3620,10 @@ class BasePlatformAdapter(ABC):
         # delivery time the transcript already contains this turn's tool
         # results and assistant reply. The old form dropped only the most
         # recent assistant entry, which left THIS turn's tool results in
-        # "history": a text_to_speech result carrying media_tag then put its
-        # own path into the dedup set and delivery silently stripped the
-        # attachment (staging repro 2026-07-29 — `response_delivery_dropped`
-        # for a MEDIA-tag-only reply; user saw TTS produce no audio).
+        # "history": a tool result carrying media_tag then put its own path
+        # into the dedup set and delivery silently stripped the attachment
+        # (staging repro 2026-07-29 — `response_delivery_dropped` for a
+        # MEDIA-tag-only reply; user saw no audio).
         history = list(transcript)
         last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
@@ -6470,7 +6339,7 @@ class BasePlatformAdapter(ABC):
                 # adapter while its in-flight handler was still producing a
                 # final response; that response is a new message, so resolve
                 # the current transport before sending it.
-                if text_content and not _tts_caption_delivered:
+                if text_content:
                     delivery_adapter = self._final_delivery_adapter(event.source)
                     logger.info(
                         "[%s] Sending response (%d chars) to %s",
@@ -6703,7 +6572,7 @@ class BasePlatformAdapter(ABC):
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
                 _anything_delivered = (
-                    delivery_attempted or _tts_caption_delivered
+                    delivery_attempted
                     or images or local_files or media_files
                 )
                 if not _anything_delivered and _response_pre_extract.strip():
@@ -6716,15 +6585,6 @@ class BasePlatformAdapter(ABC):
 
             # Determine overall success for the processing hook
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
-            # Clean up the per-turn streaming-TTS flag (#60671).
-            self._streaming_tts_completed_turns.discard(
-                self._streaming_tts_turn_key(
-                    session_key,
-                    getattr(interrupt_event, "_hermes_run_generation", None),
-                    event=event,
-                )
-                or ""
-            )
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,

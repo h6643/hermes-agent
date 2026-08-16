@@ -128,19 +128,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "opentelemetry-exporter-otlp-proto-http==1.39.1",
     ),
 
-    # ─── TTS providers ─────────────────────────────────────────────────────
-    # Pinned to exact versions to match pyproject.toml's no-ranges policy
-    # (see comment at top of [project.dependencies]). When bumping, update
-    # both this map AND the corresponding extra in pyproject.toml.
-    #
-    # mistralai pin tracks the `mistral` extra in pyproject.toml. PyPI
-    # quarantined the project 2026-05-12 (malicious 2.4.6, Mini Shai-Hulud);
-    # 2.4.6 was removed and clean releases resumed (2.4.7, 2.4.8). Voxtral
-    # STT + TTS share the same SDK.
-    "tts.mistral": ("mistralai==2.4.8",),
-    "tts.edge": ("edge-tts==7.2.7",),
-    "tts.elevenlabs": ("elevenlabs==1.59.0",),
-
     # ─── Speech-to-text providers ──────────────────────────────────────────
     "stt.mistral": ("mistralai==2.4.8",),
     "stt.faster_whisper": (
@@ -151,40 +138,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # SILK voice-note decoding (WeChat/QQ .silk voice messages). pilk is a
     # small silk-v3 codec binding; installed on first .silk transcription.
     "stt.silk": ("pilk==0.2.4",),
-
-    # ─── Wake word ("Hey Hermes") engines ──────────────────────────────────
-    # Keep in sync with the `wake` extra in pyproject.toml. openWakeWord is the
-    # free, local default (ONNX runtime); Porcupine is the premium engine.
-    # openWakeWord's ONNX embedding model returns near-zero scores on macOS
-    # ARM64 (dscripka/openWakeWord#336), so the wake word runs on the tflite
-    # backend there. Upstream declares tflite-runtime for Linux only;
-    # ai-edge-litert is the macOS equivalent, bridged in tools/wake_word.py.
-    # It lives in its own feature because lazy-dep specs cannot carry PEP 508
-    # environment markers (_spec_is_safe rejects ";"), so the platform gate is
-    # applied by the caller instead.
-    "wake.openwakeword.tflite": (
-        "ai-edge-litert==2.1.6",
-    ),
-    "wake.openwakeword": (
-        "openwakeword==0.6.0",
-        "onnxruntime==1.27.0",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-    # Open-vocabulary keyword spotting: any typed phrase, zero training.
-    # sentencepiece is required by sherpa_onnx.text2token (runtime phrase
-    # tokenization) even though sherpa-onnx doesn't declare it.
-    "wake.sherpa": (
-        "sherpa-onnx==1.13.4",
-        "sentencepiece==0.2.2",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
-    "wake.porcupine": (
-        "pvporcupine==4.0.3",
-        "sounddevice==0.5.5",
-        "numpy==2.4.3",
-    ),
 
     # ─── Image generation backends ─────────────────────────────────────────
     "image.fal": ("fal-client==0.13.1",),
@@ -326,6 +279,34 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 # Conservative regex for spec validation — package name plus optional
 # version range. Reject anything that looks like a URL, file path, or shell
 # metacharacter.
+# Specs that MUST bypass dependency resolution (``pip install --no-deps``).
+_NO_DEPS_SPECS: frozenset = frozenset()
+
+
+def _split_no_deps(specs) -> tuple:
+    """Split specs into (resolve-normally, install-with---no-deps)."""
+    plain = tuple(s for s in specs if s not in _NO_DEPS_SPECS)
+    no_deps = tuple(s for s in specs if s in _NO_DEPS_SPECS)
+    return plain, no_deps
+
+
+def _manual_install_hint(specs, *, installer: str = "uv pip install") -> str:
+    """Copy-pasteable install command that honours the --no-deps split.
+
+    Kept in sync with :func:`_venv_pip_install` so the command we print to a
+    user is the same one we would have run ourselves.
+    """
+    plain, no_deps = _split_no_deps(specs)
+    parts = []
+    if plain:
+        parts.append(installer + " " + " ".join(repr(s) for s in plain))
+    if no_deps:
+        parts.append(
+            installer + " --no-deps " + " ".join(repr(s) for s in no_deps)
+        )
+    return " && ".join(parts)
+
+
 _SAFE_SPEC = re.compile(
     r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*"        # package name
     r"(?:\[[A-Za-z0-9_,\-]+\])?"            # optional [extras]
@@ -348,11 +329,12 @@ class FeatureUnavailable(RuntimeError):
         super().__init__(self._format())
 
     def _format(self) -> str:
-        spec_list = " ".join(repr(s) for s in self.missing)
+        uv_cmd = _manual_install_hint(self.missing)
+        pip_cmd = _manual_install_hint(self.missing, installer="pip install")
         return (
             f"Feature {self.feature!r} unavailable: {self.reason}. "
-            f"To enable manually: uv pip install {spec_list}  "
-            f"(or: pip install {spec_list})."
+            f"To enable manually: {uv_cmd}  "
+            f"(or: {pip_cmd})."
         )
 
 
@@ -698,7 +680,12 @@ def _core_constraints_file() -> Optional[Path]:
         return None
 
 
-def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
+def _venv_pip_install(
+    specs: tuple[str, ...],
+    *,
+    timeout: int = 300,
+    extra_args: tuple[str, ...] = (),
+) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
     Two modes:
@@ -716,6 +703,30 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     """
     if not specs:
         return _InstallResult(True, "", "")
+
+    # Two-pass split: specs in _NO_DEPS_SPECS get their own --no-deps
+    # invocation so an unsatisfiable upstream requirement (openWakeWord's
+    # Linux-only tflite-runtime pin) cannot poison resolution for the specs
+    # that *are* installable. Normal deps go first, so the --no-deps package
+    # lands on top of an already-complete environment rather than an empty one.
+    if not extra_args:
+        plain, no_deps = _split_no_deps(specs)
+        if no_deps:
+            first = (
+                _venv_pip_install(plain, timeout=timeout)
+                if plain
+                else _InstallResult(True, "", "")
+            )
+            if not first.success:
+                return first
+            second = _venv_pip_install(
+                no_deps, timeout=timeout, extra_args=("--no-deps",)
+            )
+            return _InstallResult(
+                second.success,
+                first.stdout + second.stdout,
+                first.stderr + second.stderr,
+            )
 
     target = _lazy_install_target()
     constraints: Optional[Path] = None
@@ -756,7 +767,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         if uv_bin:
             try:
                 r = subprocess.run(
-                    [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
+                    [uv_bin, "pip", "install", *target_args, *constraint_args,
+                     *extra_args, *specs],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
@@ -804,7 +816,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
         try:
             r = subprocess.run(
-                pip_cmd + ["install", *target_args, *constraint_args, *specs],
+                pip_cmd + ["install", *target_args, *constraint_args,
+                           *extra_args, *specs],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),

@@ -92,11 +92,6 @@ class WhatsAppOnboardingApply(BaseModel):
     profile: Optional[str] = None
 
 
-class AudioTranscriptionRequest(BaseModel):
-    data_url: str
-    mime_type: Optional[str] = None
-
-
 class ManagedFileUpload(BaseModel):
     path: str
     data_url: str
@@ -301,10 +296,6 @@ class DebugShareRequest(BaseModel):
 
 
 # --- from web_server.py (originally lines 4492-4493) ---
-
-class TTSSpeakRequest(BaseModel):
-    text: str
-
 
 # --- from web_server.py (originally lines 11549-11551) ---
 

@@ -127,7 +127,6 @@ def _iter_provider_dirs() -> List[Tuple[str, Path]]:
     Scans bundled, then user-installed, then project-local.  Bundled takes
     precedence on name collisions (first-seen wins via ``seen`` set).
     """
-    seen: set = set()
     dirs: List[Tuple[str, Path]] = []
 
     # 1. Bundled providers (plugins/memory/<name>/)

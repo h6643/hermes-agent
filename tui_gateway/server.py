@@ -66,8 +66,7 @@ load_hermes_dotenv(
 # flushes through the stderr->gateway.stderr event pump. This hook
 # appends every unhandled exception to ~/.hermes/logs/tui_gateway_crash.log
 # AND re-emits a one-line summary to stderr so the TUI can surface it in
-# Activity — exactly what was missing when the voice-mode turns started
-# exiting the gateway mid-TTS.
+# Activity.
 _CRASH_LOG = os.path.join(_hermes_home, "logs", "tui_gateway_crash.log")
 
 
@@ -235,8 +234,6 @@ _LONG_HANDLERS = frozenset(
         # Generation is the heaviest pet path by far — multiple image-model
         # round-trips per call — so it must never block the reader thread.
         "pet.generate",
-        "pet.hatch",
-        "pet.info",
         "pet.select",
         "pet.thumb",
         "learning.frames",
@@ -1177,10 +1174,6 @@ def _close_sessions_for_transport(
 
 
 def _shutdown_sessions() -> None:
-    try:
-        _release_gateway_wake_owner()
-    except Exception:
-        pass
     with _sessions_lock:
         sids = list(_sessions)
     for sid in sids:
@@ -3380,6 +3373,8 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
+        search_engine = ""
+        terminal_shell = ""
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
@@ -3387,6 +3382,8 @@ def _set_session_context(
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
+                    search_engine = str(sess.get("search_engine") or "")
+                    terminal_shell = str(sess.get("terminal_shell") or "")
                     break
         return set_session_vars(
             session_key=session_key,
@@ -3395,6 +3392,8 @@ def _set_session_context(
             cwd=resolved,
             ui_session_id=ui_session_id,
             cron_session="",
+            search_engine=search_engine,
+            terminal_shell=terminal_shell,
         )
     except Exception:
         return []
@@ -3698,7 +3697,6 @@ def _pairing_sig():
 # check interval keeps the pricier probes (pet resolves the active sheet off
 # disk) off the 0.5s tick.
 _CHANGE_WATCHES: dict[str, tuple[float, Any, Any]] = {
-    "pet.changed": (2.0, _pet_sig, _pet_changed_payload),
     "cron.changed": (1.0, _cron_sig, lambda: {}),
     "sessions.changed": (0.5, _sessions_sig, lambda: {}),
     "platforms.changed": (2.0, _platforms_sig, lambda: {}),
@@ -5712,6 +5710,13 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         except Exception:
             pass
         session.setdefault("tool_started_at", {})[tool_call_id] = time.time()
+        # 后台进程实时输出路由：terminal/process 等工具启动时，把 command →
+        # tool_call_id 记到会话上。on_output sink（见 _ensure_process_output_sink）
+        # 收到进程输出块后据此把 tool.progress 事件路由到正确的工具卡片。
+        if name in ("terminal", "process", "bash", "docker") and isinstance(args, dict):
+            cmd = str(args.get("command") or "").strip()
+            if cmd:
+                session.setdefault("tool_commands", {})[cmd] = tool_call_id
     if _tool_progress_enabled(sid) or _tool_lifecycle_required_for_ui(name):
         payload: dict[str, object] = {
             "tool_id": tool_call_id,
@@ -5742,6 +5747,12 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     if session is not None:
         snapshot = session.setdefault("edit_snapshots", {}).pop(tool_call_id, None)
         started_at = session.setdefault("tool_started_at", {}).pop(tool_call_id, None)
+        # 后台进程实时输出路由：工具完成即移除 command → tool_call_id 映射，
+        # 防止同命令二次调用时输出路由到旧卡片（映射被覆盖）。
+        if name in ("terminal", "process", "bash", "docker") and isinstance(args, dict):
+            cmd = str(args.get("command") or "").strip()
+            if cmd:
+                (session.get("tool_commands") or {}).pop(cmd, None)
     duration_s = time.time() - started_at if started_at else None
     if duration_s is not None:
         payload["duration_s"] = duration_s
@@ -5779,6 +5790,55 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         pass
     if _tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name):
         _emit("tool.complete", sid, payload)
+
+
+# ── 后台进程实时输出 → tool.progress ────────────────────────────────────
+# terminal_tool(background=True) 等后台任务由 tools.process_registry 跟踪，
+# 其 reader 线程把新输出块喂给 on_output sink（见 process_registry._emit_output）。
+# 这里把 sink 接到 serve 网关：按会话的 command→tool_call_id 映射（在
+# _on_tool_start 登记），把输出块作为 tool.progress 事件推给前端，让工具卡片
+# 实时显示「docker pull / npm install」等长任务的进度（类似官方桌面端）。
+_process_output_sink_installed = False
+
+
+def _ensure_process_output_sink() -> None:
+    global _process_output_sink_installed
+    if _process_output_sink_installed:
+        return
+    try:
+        from tools.process_registry import process_registry
+
+        def _on_process_output(session, chunk: str) -> None:
+            try:
+                if not chunk:
+                    return
+                # 找到会话对应的 live sid
+                key = str(getattr(session, "session_key", "") or "")
+                if not key:
+                    return
+                live = _find_live_session_by_key(key)
+                if live is None:
+                    return
+                sid, sess = live
+                # command → tool_call_id
+                cmd = str(getattr(session, "command", "") or "").strip()
+                if not cmd:
+                    return
+                tool_call_id = (sess.get("tool_commands") or {}).get(cmd, "")
+                if not tool_call_id:
+                    return
+                _emit("tool.progress", sid, {
+                    "tool_id": tool_call_id,
+                    "name": "terminal",
+                    "text": chunk,
+                })
+            except Exception:
+                pass
+
+        process_registry.on_output = _on_process_output
+        _process_output_sink_installed = True
+    except Exception:
+        pass
 
 
 def _on_tool_progress(
@@ -10357,8 +10417,6 @@ def _run_prompt_submit(
         secret_token = None
         goal_followup = None  # set by the post-turn goal hook below
         result = None  # turn outcome; read after the finally for leftover /steer
-        tts_queue = None  # streaming-TTS feed for this turn (voice mode)
-        thinking_started = False  # ambient thinking sound armed for this turn
         one_turn_restore = session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
@@ -10577,8 +10635,6 @@ def _run_prompt_submit(
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
-                if tts_queue is not None and isinstance(delta, str):
-                    tts_queue.put(delta)
                 _emit("message.delta", sid, payload)
 
             # Surface interim assistant text (commentary emitted alongside
@@ -11010,6 +11066,46 @@ def _run_prompt_submit(
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
                     logger.warning("voice TTS dispatch failed: %s", e)
+
+            # Auto-title the session once the first turn completes, so the
+            # sidebar renames without waiting for the next list refresh.
+            # (0.20.1 feature, kept alongside Helix's voice TTS fallback above.)
+            if (
+                status == "complete"
+                and isinstance(raw, str)
+                and raw.strip()
+                and isinstance(text, str)
+                and text.strip()
+            ):
+                try:
+                    from agent.title_generator import maybe_auto_title
+
+                    _title_key = session.get("session_key") or sid
+                    _title_model = getattr(agent, "model", None)
+                    _title_provider = getattr(agent, "provider", None)
+                    maybe_auto_title(
+                        _get_db(),
+                        _title_key,
+                        text,
+                        raw,
+                        session.get("history", []),
+                        main_runtime={
+                            "model": getattr(agent, "model", None),
+                            "provider": getattr(agent, "provider", None),
+                            "base_url": getattr(agent, "base_url", None),
+                            "api_key": getattr(agent, "api_key", None),
+                            "api_mode": getattr(agent, "api_mode", None),
+                        },
+                        runtime_validator=lambda: (
+                            getattr(agent, "model", None) == _title_model
+                            and getattr(agent, "provider", None) == _title_provider
+                        ),
+                        title_callback=lambda t, _k=_title_key: _emit(
+                            "session.title", sid, {"session_id": _k, "title": t}
+                        ),
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             import traceback
 
@@ -11065,17 +11161,6 @@ def _run_prompt_submit(
             except Exception:
                 logger.debug("post-turn memory trim failed", exc_info=True)
 
-            if thinking_started:
-                # Kill the ambient thinking sound the moment the turn ends —
-                # error and success paths both land here.
-                try:
-                    from tools.voice_mode import stop_thinking_sound
-
-                    stop_thinking_sound()
-                except Exception:
-                    pass
-            if tts_queue is not None:
-                tts_queue.put(None)  # end-of-text sentinel — flush + finish speaking
             if one_turn_restore:
                 try:
                     _restore_agent_model_runtime(agent, one_turn_restore)

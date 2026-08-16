@@ -139,7 +139,10 @@ def create_environment(
         return LocalEnvironment(cwd=cwd, timeout=timeout)
     
     elif env_type == "docker":
-        from tools.environments.docker import DockerEnvironment
+        try:
+            from tools.environments.docker import DockerEnvironment
+        except ImportError:
+            raise RuntimeError("Docker environment support is not installed.")
         return DockerEnvironment(image=image, cwd=cwd, timeout=timeout, **kwargs)
     
     elif env_type == "modal":

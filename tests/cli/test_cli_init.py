@@ -267,12 +267,9 @@ class TestPromptToolkitTerminalCompatibility:
 
 
 class TestSingleQueryState:
-    def test_voice_and_interrupt_state_initialized_before_run(self):
+    def test_interrupt_state_initialized_before_run(self):
         """Single-query mode calls chat() without going through run()."""
         cli = _make_cli()
-        assert cli._voice_tts is False
-        assert cli._voice_mode is False
-        assert cli._voice_tts_done.is_set()
         assert hasattr(cli, "_interrupt_queue")
         assert hasattr(cli, "_pending_input")
 

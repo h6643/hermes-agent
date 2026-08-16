@@ -255,6 +255,16 @@ class TestWebServerEndpoints:
 
         monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", get_hermes_home() / "state.db")
 
+        # 外置记忆 Provider 不内置：运行时只扫用户安装目录。这些测试用 repo
+        # 源码里的 provider（hindsight/honcho/…），把它们挂到用户插件目录路径
+        # 下，等价于「用户已安装」；同时把依赖判定视为已装——这里测的是
+        # config/setup 读写逻辑，依赖判定本身由 tests/plugins/memory 覆盖。
+        import plugins.memory as _pm
+        import hermes_cli.web_server as _ws
+        _repo_memory = _pm._MEMORY_PLUGINS_DIR
+        monkeypatch.setattr(_pm, "_get_user_plugins_dir", lambda: _repo_memory)
+        monkeypatch.setattr(_ws, "_memory_provider_dependencies_installed", lambda setup: True)
+
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 

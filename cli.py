@@ -982,7 +982,6 @@ def _cleanup_all_browsers(*args, **kwargs):
 
 # Guard to prevent cleanup from running multiple times on exit
 _cleanup_done = False
-_cli_wake_owner = None
 # One-shot CLI finalization runs before process cleanup so plugins can observe
 # the session boundary while the agent is still attached. If a signal lands in
 # that narrow window, atexit cleanup must not emit that session finalize again.
@@ -1183,12 +1182,6 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
     # can't skip the reset (#36823). No-op unless the TUI actually ran.
     _reset_terminal_input_modes_on_exit()
 
-    try:
-        from tools.wake_word import stop_listening as _stop_wake_word
-        if _cli_wake_owner is not None:
-            _stop_wake_word(owner=_cli_wake_owner)
-    except Exception:
-        pass
     try:
         _cleanup_all_terminals()
     except Exception:
@@ -4529,13 +4522,10 @@ def save_config_value(key_path: str, value: any) -> bool:
     #
     # We deliberately do NOT fall back to the repo's project cli-config.yaml:
     # that file is a shipped default/template, and most config readers
-    # (load_config → get_hermes_home()/config.yaml, including
-    # load_wake_word_config) never read it. Writing a user setting there means
-    # the reader never sees it. This was the "wake-word ear reverts to disabled
-    # after restart" bug — the toggle's persist wrote to cli-config.yaml (which
-    # exists in the checkout) while startup read HERMES_HOME/config.yaml, so the
-    # setting silently vanished every restart on any install whose
-    # HERMES_HOME/config.yaml didn't exist yet.
+    # (load_config → get_hermes_home()/config.yaml) never read it. Writing a
+    # user setting there means the reader never sees it — the setting silently
+    # vanished every restart on any install whose HERMES_HOME/config.yaml
+    # didn't exist yet.
     config_path = get_hermes_home() / 'config.yaml'
     
     try:
@@ -4600,23 +4590,6 @@ def _split_model_config_default(raw_default: Any) -> tuple[str, str]:
     # backward compat with existing call sites in this module.
     from hermes_cli.config import split_model_config_default
     return split_model_config_default(raw_default)
-
-
-class _VoiceInputMessage:
-    """Sentinel wrapper for voice-transcribed messages in ``_pending_input``.
-
-    Distinguishes STT output from manually typed text while voice mode is
-    active, so the concise-voice-response prefix is applied only to messages
-    that actually came from the microphone (#65827).
-    """
-
-    __slots__ = ("text",)
-
-    def __init__(self, text: str):
-        self.text = text
-
-    def __str__(self) -> str:
-        return self.text
 
 
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
@@ -6529,60 +6502,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if thread is not None:
             thread.join(timeout=0.3)
         self._pet_anim_thread = None
-
-    def _voice_record_key_label(self) -> str:
-        """Return the configured voice push-to-talk key formatted for UI.
-
-        Shared helper so every voice-facing status line / placeholder /
-        recording hint advertises the SAME label as the registered
-        prompt_toolkit binding.
-
-        Cached at startup (see ``set_voice_record_key_cache``) rather
-        than re-read per render. Two reasons (Copilot round-13 on
-        #19835):
-
-        * The prompt_toolkit binding is registered once at session
-          start via ``@kb.add(_voice_key)``; re-reading config per
-          render meant the status bar could advertise a new shortcut
-          after a config edit while the actual binding was still the
-          startup chord — exactly the display/binding drift this PR
-          is trying to eliminate.
-        * The label is on the hot render path (status bar + composer
-          placeholder invalidated every 150ms during recording), so
-          reading config on every call added avoidable UI overhead.
-        """
-        return getattr(self, "_voice_record_key_display_cache", None) or "Ctrl+B"
-
-    def set_voice_record_key_cache(self, raw_key: object) -> None:
-        """Populate the voice label cache from a raw ``voice.record_key``.
-
-        Called at CLI startup after the prompt_toolkit binding is
-        registered so the cached label always matches the live binding.
-        """
-        try:
-            from hermes_cli.voice import format_voice_record_key_for_status
-            self._voice_record_key_display_cache = format_voice_record_key_for_status(raw_key)
-        except Exception:
-            self._voice_record_key_display_cache = "Ctrl+B"
-
-    def _get_voice_status_fragments(self, width: Optional[int] = None):
-        """Return the voice status bar fragments for the interactive TUI."""
-        width = width or self._get_tui_terminal_width()
-        compact = self._use_minimal_tui_chrome(width=width)
-        label = self._voice_record_key_label()
-        if self._voice_recording:
-            if compact:
-                return [("class:voice-status-recording", " ● REC ")]
-            return [("class:voice-status-recording", f" ● REC  {label} to stop ")]
-        if self._voice_processing:
-            if compact:
-                return [("class:voice-status", " ◉ STT ")]
-            return [("class:voice-status", " ◉ Transcribing... ")]
-        if compact:
-            return [("class:voice-status", f" 🎤 {label} ")]
-        tts = " | TTS on" if self._voice_tts else ""
-        cont = " | Continuous" if self._voice_continuous else ""
-        return [("class:voice-status", f" 🎤 Voice mode{tts}{cont}  —  {label} to record ")]
 
     @staticmethod
     def _status_bar_goal_segment(snapshot: Dict[str, Any]) -> str:
@@ -11561,10 +11480,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_subgoal_command(cmd_original)
         elif canonical == "skin":
             self._handle_skin_command(cmd_original)
-        elif canonical == "voice":
-            self._handle_voice_command(cmd_original)
-        elif canonical == "wake":
-            self._handle_wake_command(cmd_original)
         elif canonical == "busy":
             self._handle_busy_command(cmd_original)
         elif canonical == "indicator":
@@ -13395,7 +13310,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"  ┊ {emoji} preparing {tool_name}…")
 
     # ====================================================================
-    # Tool progress callback (audio cues for voice mode)
+    # Tool progress callback
     # ====================================================================
 
     def _on_tool_progress(self, event_type: str, function_name: str = None, preview: str = None, function_args: dict = None, **kwargs):
@@ -15097,7 +15012,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -15112,8 +15027,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Args:
             message: The user's message (str or multimodal content list)
             images: Optional list of Path objects for attached images
-            voice_input: True when the message came from voice transcription
-                (gates the concise voice-response prefix, #65827)
             
         Returns:
             The agent's response, or None on error
@@ -15414,7 +15327,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 except Exception:
                     reset_current_session_key = None  # type: ignore[assignment]
                     _approval_session_token = None
-                agent_message = _voice_prefix + message if _voice_prefix else message
+                agent_message = message
                 # Prepend pending notes via _prepend_note_to_message, which
                 # handles both plain-string and multimodal content-parts list
                 # messages. Naive ``note + "\n\n" + agent_message`` crashed with
@@ -15431,21 +15344,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if _srn:
                     agent_message = _prepend_note_to_message(agent_message, _srn)
                     self._pending_skills_reload_note = None
-                # Barged mid-speech (VAD or record key)? Tell the model it was
-                # cut off — same one-shot, API-local note channel as above.
-                from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
-                if take_speech_interrupted():
-                    agent_message = _prepend_note_to_message(agent_message, SPEECH_INTERRUPTED_NOTE)
-                _moa_cfg = getattr(self, "_pending_moa_config", None)
-                self._pending_moa_config = None
-                if _moa_cfg is None:
-                    _moa_cfg = None
-                # Model/skill notes and voice instructions are API-local. Keep
+                # Model/skill notes are API-local. Keep
                 # the original staged input as the durable transcript value so a
                 # close-path marker follows the same dict into turn setup rather
                 # than producing a second noted user row (#63766).
                 _persist_clean_user_message = (
-                    message if (_voice_prefix or agent_message != message) else None
+                    message if agent_message != message else None
                 )
                 _one_turn_model_restore = getattr(
                     self, "_pending_one_turn_model_restore", None
@@ -15455,7 +15359,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     result = self.agent.run_conversation(
                         user_message=agent_message,
                         conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
-                        stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
@@ -15515,27 +15418,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             agent_thread = threading.Thread(target=run_agent, daemon=True)
             agent_thread.start()
 
-            # Ambient "thinking" sound: calm bubble blips while the agent
-            # works in voice mode with no audio flowing, so the user knows
-            # it's alive during long thinking/tool stretches. Skipped per-blip
-            # while TTS speaks, the mic records, or a barge capture is live;
-            # stopped outright as soon as the turn ends. voice.thinking_sound
-            # gates it (default on); macOS is handled inside (TCC-safe skip).
-            _thinking_started = False
-            if self._voice_mode:
-                try:
-                    from tools.voice_mode import start_thinking_sound
-
-                    _thinking_started = start_thinking_sound(
-                        should_play=lambda: (
-                            self._voice_tts_done.is_set()
-                            and not self._voice_recording
-                            and not self._voice_barge_capture.is_set()
-                        )
-                    )
-                except Exception:
-                    _thinking_started = False
-
             # Monitor the dedicated interrupt queue while the agent runs.
             # _interrupt_queue is separate from _pending_input, so process_loop
             # and chat() never compete for the same queue.
@@ -15561,9 +15443,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 interrupt_msg = None
                                 continue
                             print("\n⚡ New message detected, interrupting...")
-                            # Signal TTS to stop on interrupt
-                            if stop_event is not None:
-                                stop_event.set()
                             self.agent.interrupt(interrupt_msg)
                             # Clear any active overlay states the interrupted agent
                             # left behind.  approval/clarify/sudo/secret prompts gate
@@ -15644,18 +15523,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Flush any remaining streamed text and close the box
             self._flush_stream()
 
-            # Signal end-of-text to TTS consumer and wait for it to finish
-            if use_streaming_tts and text_queue is not None:
-                text_queue.put(None)  # sentinel
-                if tts_thread is not None:
-                    tts_thread.join(timeout=120)
-                # Mark normal completion only if the thread actually
-                # finished.  If join() timed out and the thread is still
-                # alive, leave _tts_normal_exit False so the finally block
-                # sets stop_event to kill the runaway worker.
-                if tts_thread is not None and not tts_thread.is_alive():
-                    _tts_normal_exit = True
-
             # Drain any remaining agent output still in the StdoutProxy
             # buffer so tool/status lines render ABOVE our response box.
             # The flush pushes data into the renderer queue; the short
@@ -15696,11 +15563,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if result and (result.get("failed") or result.get("partial")) and not response:
                 error_detail = result.get("error", "Unknown error")
                 response = f"Error: {error_detail}"
-                # Stop continuous voice mode on persistent errors (e.g. 429 rate limit)
-                # to avoid an infinite error → record → error loop
-                if self._voice_continuous:
-                    self._voice_continuous = False
-                    _cprint(f"\n{_DIM}Continuous voice mode stopped due to error.{_RST}")
 
             # Handle interrupt - check if we were interrupted
             pending_message = None
@@ -15787,11 +15649,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
-                if use_streaming_tts and _streaming_box_opened and not is_error_response:
-                    # Text was already printed sentence-by-sentence; just close the box
-                    w = self._scrollback_box_width()
-                    _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
-                elif already_streamed:
+                if already_streamed:
                     # Response was already streamed token-by-token with box framing;
                     # _flush_stream() already closed the box. Skip Rich Panel.
                     # A transform hook runs after streaming. Show a suffix for
@@ -15884,11 +15742,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         f"response may be incomplete{_RST}"
                     )
 
-            # Speak response aloud if voice TTS is enabled
-            # Skip batch TTS when streaming TTS already handled it
-            if self._voice_tts and response and not use_streaming_tts:
-                self._voice_speak_response_async(response)
-
 
             # Re-queue the interrupt message (and any that arrived while we were
             # processing the first) as the next prompt for process_loop.
@@ -15926,34 +15779,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception as e:
             print(f"Error: {e}")
             return None
-        finally:
-            # Stop the ambient thinking sound the moment the turn ends —
-            # every exit path (normal, error, interrupt) lands here.
-            if _thinking_started:
-                try:
-                    from tools.voice_mode import stop_thinking_sound
-                    stop_thinking_sound()
-                except Exception:
-                    pass
-            # Ensure streaming TTS resources are cleaned up even on error.
-            # Normal path sends the sentinel at line ~3568; this is a safety
-            # net for exception paths that skip it.  Duplicate sentinels are
-            # harmless — stream_tts_to_speaker exits on the first None.
-            #
-            # Only set stop_event on the exception path.  On normal exit
-            # (_tts_normal_exit is True) the pipeline has already drained —
-            # setting stop_event here would race the playback worker and
-            # could cut the final sentence mid-audio.
-            if text_queue is not None:
-                try:
-                    text_queue.put_nowait(None)
-                except Exception:
-                    pass
-            if stop_event is not None and not _tts_normal_exit:
-                logger.info("TTS CUT: exception finally block setting stop_event")
-                stop_event.set()
-            if tts_thread is not None and tts_thread.is_alive():
-                tts_thread.join(timeout=5)
     
     def _clear_terminal_on_exit(self):
         """Clear screen + scrollback so nothing is stranded above the exit summary.
@@ -16189,18 +16014,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Icon-only custom prompts should still remain visible in special states.
         return symbol, symbol
 
-    def _audio_level_bar(self) -> str:
-        """Return a visual audio level indicator based on current RMS."""
-        _LEVEL_BARS = " ▁▂▃▄▅▆▇"
-        rec = getattr(self, "_voice_recorder", None)
-        if rec is None:
-            return ""
-        rms = rec.current_rms
-        # Normalize RMS (0-32767) to 0-7 index, with log-ish scaling
-        # Typical speech RMS is 500-5000, we cap display at ~8000
-        level = min(rms, 8000) * 7 // 8000
-        return _LEVEL_BARS[level]
-
     def _get_tui_prompt_fragments(self):
         """Return the prompt_toolkit fragments for the current interactive state."""
         symbol, state_suffix = self._get_tui_prompt_symbols()
@@ -16216,11 +16029,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return [(style, f"{icon} {extra} {state_suffix}")]
             return [(style, f"{icon} {state_suffix}")]
 
-        if self._voice_recording:
-            bar = self._audio_level_bar()
-            return _state_fragment("class:voice-recording", "●", bar)
-        if self._voice_processing:
-            return _state_fragment("class:voice-processing", "◉")
         if self._sudo_state:
             return _state_fragment("class:sudo-prompt", "🔐")
         if self._secret_state:
@@ -16237,8 +16045,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return _state_fragment("class:prompt-working", self._command_spinner_frame())
         if self._agent_running:
             return _state_fragment("class:prompt-working", "⚕")
-        if self._voice_mode:
-            return _state_fragment("class:voice-prompt", "🎤")
         return [("class:prompt", symbol)]
 
     def _get_tui_prompt_text(self) -> str:
@@ -16340,7 +16146,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         image_bar,
         input_area,
         input_rule_bot,
-        voice_status_bar,
         completions_menu,
     ) -> list:
         """Assemble the ordered list of children for the root ``HSplit``.
@@ -16368,7 +16173,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 image_bar,
                 input_area,
                 input_rule_bot,
-                voice_status_bar,
                 completions_menu,
             ] if item is not None
         ]
@@ -17352,31 +17156,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             """Handle Ctrl+C - cancel interactive prompts, interrupt agent, or exit.
             
             Priority:
-            0. Cancel active voice recording
             1. Cancel active sudo/approval/clarify prompt
             2. Interrupt the running agent (first press)
             3. Force exit (second press within 2s, or when idle)
             """
             now = time.time()
-
-            # Cancel active voice recording.
-            # Run cancel() in a background thread to prevent blocking the
-            # event loop if AudioRecorder._lock or CoreAudio takes time.
-            _should_cancel_voice = False
-            _recorder_ref = None
-            with cli_ref._voice_lock:
-                if cli_ref._voice_recording and cli_ref._voice_recorder:
-                    _recorder_ref = cli_ref._voice_recorder
-                    cli_ref._voice_recording = False
-                    cli_ref._voice_continuous = False
-                    _should_cancel_voice = True
-            if _should_cancel_voice:
-                _cprint(f"\n{_DIM}Recording cancelled.{_RST}")
-                threading.Thread(
-                    target=_recorder_ref.cancel, daemon=True
-                ).start()
-                event.app.invalidate()
-                return
 
             # Cancel slash confirmation prompt (foreground UI, not an
             # agent-blocking overlay — cancel and stop here).
@@ -17453,23 +17237,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             running agent, or clears the input buffer. Does not support
             the double-press 'force exit' feature of Ctrl+C.
             """
-            # Cancel active voice recording.
-            _should_cancel_voice = False
-            _recorder_ref = None
-            with cli_ref._voice_lock:
-                if cli_ref._voice_recording and cli_ref._voice_recorder:
-                    _recorder_ref = cli_ref._voice_recorder
-                    cli_ref._voice_recording = False
-                    cli_ref._voice_continuous = False
-                    _should_cancel_voice = True
-            if _should_cancel_voice:
-                _cprint(f"\n{_DIM}Recording cancelled.{_RST}")
-                threading.Thread(
-                    target=_recorder_ref.cancel, daemon=True
-                ).start()
-                event.app.invalidate()
-                return
-
             # Cancel slash confirmation prompt (foreground UI — cancel and stop).
             if self._slash_confirm_state:
                 self._submit_slash_confirm_response("cancel")
@@ -17952,11 +17719,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return Transformation(fragments=ti.fragments)
 
         def _get_placeholder():
-            if cli_ref._voice_recording:
-                _label = cli_ref._voice_record_key_label()
-                return f"recording... {_label} to stop, Ctrl+C to cancel"
-            if cli_ref._voice_processing:
-                return "transcribing..."
             if cli_ref._sudo_state:
                 return "type password (hidden), Enter to submit · ESC to skip"
             if cli_ref._secret_state:
@@ -17975,9 +17737,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return f"{frame} {status}"
             if cli_ref._agent_running:
                 return "msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel"
-            if cli_ref._voice_mode:
-                _label = cli_ref._voice_record_key_label()
-                return f"type or {_label} to record"
             # Advertise a parked draft so the stash can never be silently
             # forgotten — the composer itself tells you how to get it back.
             _stash_hint = ""
@@ -18532,18 +18291,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             height=Condition(lambda: bool(cli_ref._attached_images)),
         )
 
-        # Persistent voice mode status bar (visible only when voice mode is on)
-        def _get_voice_status():
-            return cli_ref._get_voice_status_fragments()
-
-        voice_status_bar = ConditionalContainer(
-            Window(
-                FormattedTextControl(_get_voice_status),
-                height=1,
-            ),
-            filter=Condition(lambda: cli_ref._voice_mode),
-        )
-
         status_bar = ConditionalContainer(
             Window(
                 content=FormattedTextControl(lambda: cli_ref._get_status_bar_fragments()),
@@ -18612,7 +18359,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     image_bar=image_bar,
                     input_area=input_area,
                     input_rule_bot=input_rule_bot,
-                    voice_status_bar=voice_status_bar,
                     completions_menu=completions_menu,
                 )
             )
@@ -18668,12 +18414,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             'approval-cmd': '#AAAAAA italic',
             'approval-choice': '#AAAAAA',
             'approval-selected': '#FFD700 bold',
-            # Voice mode
-            'voice-prompt': '#87CEEB',
-            'voice-recording': '#FF4444 bold',
-            'voice-processing': '#FFA500 italic',
-            'voice-status': 'bg:#1a1a2e #87CEEB',
-            'voice-status-recording': 'bg:#1a1a2e #FF4444 bold',
         }
         style = PTStyle.from_dict(self._build_tui_style_dict())
 
@@ -18837,15 +18577,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
-                    # Voice-transcribed messages arrive wrapped in a sentinel
-                    # so only genuine STT output gets the voice prefix (#65827).
-                    is_voice_input = isinstance(user_input, _VoiceInputMessage)
-                    if is_voice_input:
-                        user_input = user_input.text
-
                     if not user_input:
                         continue
-
                     # The user has typed and submitted something, so any
                     # post-resize transient suppression should end here.
                     self._status_bar_suppressed_after_resize = False
@@ -18861,14 +18594,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         if _had_mouse_reports:
                             self._recover_terminal_input_modes(reason="mouse reports leaked into submitted input")
 
-                    # Typed bare stop phrase while a voice chat is active ends
-                    # the voice chat (same semantics as SAYING "stop") instead
-                    # of sending the word to the agent. Voice transcripts are
-                    # already stop-checked at the transcription points, so this
-                    # only intercepts typed input.
-                    if not is_voice_input and self._typed_voice_stop(user_input):
-                        continue
-                    
                     # Check for commands — but detect dragged/pasted file paths first.
                     # See _detect_file_drop() for details.
                     _file_drop = _detect_file_drop(user_input) if isinstance(user_input, str) else None
@@ -18957,7 +18682,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(user_input, images=submit_images or None)
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""
@@ -19062,16 +18787,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Start processing thread
         process_thread = threading.Thread(target=process_loop, daemon=True)
         process_thread.start()
-
-        # Wake word ("Hey Hermes") — start the always-on hotword listener if
-        # enabled. Off-thread so a first-run engine install never blocks the
-        # prompt; best-effort, so deps/mic/key gaps are surfaced, never fatal.
-        def _wake_startup():
-            try:
-                self._maybe_start_wake_word()
-            except Exception as e:
-                logger.debug("wake-word startup skipped: %s", e)
-        threading.Thread(target=_wake_startup, daemon=True, name="wake-startup").start()
 
         # Register atexit cleanup so resources are freed even on unexpected exit
         atexit.register(_run_cleanup)
@@ -19321,19 +19036,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     request_hard_interrupt(self.agent)
                 except Exception:
                     pass
-            # Shut down voice recorder (release persistent audio stream)
-            if hasattr(self, '_voice_recorder') and self._voice_recorder:
-                try:
-                    self._voice_recorder.shutdown()
-                except Exception:
-                    pass
-                self._voice_recorder = None
-            # Clean up old temp voice recordings
-            try:
-                from tools.voice_mode import cleanup_temp_recordings
-                cleanup_temp_recordings()
-            except Exception:
-                pass
             # Unregister callbacks to avoid dangling references
             set_sudo_password_callback(None)
             set_approval_callback(None)

@@ -69,6 +69,19 @@ def _(rid, params: dict) -> dict:
         create_service_tier_override = (
             "priority" if is_truthy_value(params.get("fast")) else ""
         )
+    # Desktop 常规「增强 Find 和 Grep」：新建会话时把 search_engine 钉在会话上
+    # （"rg" = 该会话的 find/grep 强制走 ripgrep；空 = 用默认引擎）。只作用于
+    # 本会话——当前会话保持创建时的设置，重启后恢复的会话按持久化的会话设置
+    # 重新绑定（见 server.py _set_session_context）。
+    search_engine = str(params.get("search_engine") or "").strip().lower()
+    if search_engine and search_engine != "rg":
+        search_engine = ""
+    # Desktop 常规「集成终端 Shell」：Windows 下 Bash 工具用此 shell（仅新会话
+    # 生效）。"cmd" = 始终 cmd.exe；"auto"（或空） = 优先 Git Bash，找不到回退
+    # cmd.exe。绑定方式同 search_engine。
+    terminal_shell = str(params.get("terminal_shell") or "").strip().lower()
+    if terminal_shell and terminal_shell != "cmd":
+        terminal_shell = "auto"
 
     ready = threading.Event()
     now = time.time()
@@ -96,6 +109,8 @@ def _(rid, params: dict) -> dict:
             "model_override": session_model_override,
             "create_reasoning_override": create_reasoning_override,
             "create_service_tier_override": create_service_tier_override,
+            "search_engine": search_engine,
+            "terminal_shell": terminal_shell,
             "parent_session_id": parent_session_id,
             "pending_title": title or None,
             "pending_hidden": is_truthy_value(params.get("hidden", False)),
@@ -1414,48 +1429,25 @@ def _(rid, params: dict) -> dict:
 
 @method("session.context_breakdown")
 def _(rid, params: dict) -> dict:
+    """Live context-window usage breakdown for the session's agent.
+
+    Returns Cursor-style category sizes so the desktop's ContextUsageIndicator
+    can render the segmented bar. Uses agent/context_breakdown.py's rough
+    char/4 estimate — the same heuristic as compression thresholds.
+    """
+    try:
+        from agent.context_breakdown import compute_session_context_breakdown
+    except Exception as exc:  # noqa: BLE001 - never break the surface on import
+        logger.debug("context_breakdown import failed: %s", exc)
+        return _ok(rid, {"categories": [], "context_max": 0, "context_used": 0, "context_percent": 0})
     session, err = _sess_nowait(params, rid)
     if err:
         return err
     agent = session.get("agent")
     if agent is None:
-        usage = _session_usage_snapshot(session) or _get_usage(None)
-        return _ok(
-            rid,
-            {
-                "categories": [],
-                "context_max": usage.get("context_max", 0) or 0,
-                "context_percent": usage.get("context_percent", 0) or 0,
-                "context_used": usage.get("context_used", 0) or 0,
-                "estimated_total": usage.get("context_used", 0) or usage.get("total", 0) or 0,
-                "model": _metadata_mirror(session).get("model", ""),
-            },
-        )
-    with session["history_lock"]:
-        history = list(session.get("history", []))
-    try:
-        from agent.context_breakdown import compute_session_context_breakdown
-
-        payload = compute_session_context_breakdown(agent, history)
-    except Exception as exc:
-        return _err(rid, 5000, f"Could not compute context breakdown: {exc}")
-    return _ok(rid, payload)
-
-
-@method("pet.info")
-@_profile_scoped
-def _(rid, params: dict) -> dict:
-    """Return the active petdex pet for surfaces that render sprites.
-
-    Shared by the desktop (canvas) and the TUI (half-block). Carries the
-    spritesheet bytes (base64) plus the engine's frame geometry + state-row
-    taxonomy so the renderer is a thin, framework-native consumer. The
-    activity→state decision is mirrored from ``agent.pet.state`` client-side.
-
-    Agent-independent (reads config + disk), so it works on any session and
-    before the agent finishes building. Fail-open: returns ``enabled=False``
-    on any error rather than erroring the surface.
-    """
+        # Agent not built yet — nothing to measure; the UI falls back to its
+        # local per-conversation store for the ring.
+        return _ok(rid, {"categories": [], "context_max": 0, "context_used": 0, "context_percent": 0})
     try:
         enabled, pet, scale = _pet_active_selection()
 
@@ -1474,12 +1466,11 @@ def _(rid, params: dict) -> dict:
 
         return _ok(rid, payload)
     except Exception as exc:  # noqa: BLE001 - cosmetic, never break the surface
-        logger.debug("pet.info failed: %s", exc)
-        return _ok(rid, {"enabled": False})
+        logger.warning("session.context_breakdown failed: %s", exc)
+        return _ok(rid, {"categories": [], "context_max": 0, "context_used": 0, "context_percent": 0})
 
 
 @method("pet.info.meta")
-@_profile_scoped
 def _(rid, params: dict) -> dict:
     """Cheap active-pet metadata used to avoid full payload refreshes."""
     try:
@@ -1692,33 +1683,6 @@ def _(rid, params: dict) -> dict:
 @method("pet.select")
 @_profile_scoped
 def _(rid, params: dict) -> dict:
-    """Adopt a pet from the desktop picker: install (if needed) + activate.
-
-    Params: ``slug`` (required). Writes ``display.pet.*`` to config and returns
-    ``{ok, slug, displayName}``. The surface re-pulls ``pet.info`` to render it.
-    """
-    slug = str(params.get("slug") or "").strip()
-    if not slug:
-        return _err(rid, 4004, "missing slug")
-    try:
-        from agent.pet import store
-        from agent.pet.manifest import ManifestError
-        from hermes_cli.pets import _set_active
-
-        try:
-            pet = store.install_pet(slug)
-        except (store.PetStoreError, ManifestError) as exc:
-            return _err(rid, 5031, f"could not adopt '{slug}': {exc}")
-        _set_active(slug)
-        return _ok(rid, {"ok": True, "slug": slug, "displayName": pet.display_name})
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("pet.select failed: %s", exc)
-        return _err(rid, 5031, f"pet.select failed: {exc}")
-
-
-@method("pet.remove")
-@_profile_scoped
-def _(rid, params: dict) -> dict:
     """Uninstall a pet from the desktop picker (delete its on-disk directory).
 
     Params: ``slug`` (required). If the removed pet was the active one, the
@@ -1747,33 +1711,6 @@ def _(rid, params: dict) -> dict:
 
 
 @method("pet.export")
-@_profile_scoped
-def _(rid, params: dict) -> dict:
-    """Export an installed pet as a re-importable ``.zip`` (pet.json + sprite).
-
-    Params: ``slug`` (required). Returns ``{ok, filename, zipBase64}`` — the
-    client decodes the base64 and saves it. Heavy-ish (reads + zips files) but
-    small; runs inline.
-    """
-    slug = str(params.get("slug") or "").strip()
-    if not slug:
-        return _err(rid, 4004, "missing slug")
-    try:
-        import base64
-
-        from agent.pet import store
-
-        filename, data = store.export_pet(slug)
-        return _ok(
-            rid,
-            {"ok": True, "filename": filename, "zipBase64": base64.standard_b64encode(data).decode("ascii")},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("pet.export failed: %s", exc)
-        return _err(rid, 5031, f"pet.export failed: {exc}")
-
-
-@method("pet.rename")
 @_profile_scoped
 def _(rid, params: dict) -> dict:
     """Rename an installed pet's display name + realign its slug/dir.
@@ -1849,40 +1786,6 @@ def _(rid, params: dict) -> dict:
 @method("pet.disable")
 @_profile_scoped
 def _(rid, params: dict) -> dict:
-    """Turn the pet off from the desktop picker (``display.pet.enabled=false``)."""
-    try:
-        from hermes_cli.pets import _set_enabled
-
-        _set_enabled(False)
-        return _ok(rid, {"ok": True})
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("pet.disable failed: %s", exc)
-        return _err(rid, 5031, f"pet.disable failed: {exc}")
-
-
-@method("pet.scale")
-@_profile_scoped
-def _(rid, params: dict) -> dict:
-    """Persist ``display.pet.scale`` from the desktop slider. Params: ``scale``.
-
-    Clamped to the engine bounds. The renderer updates its own ``$petInfo`` for
-    instant feedback; this just makes the change durable + visible to the other
-    terminal surfaces on their next read.
-    """
-    try:
-        from hermes_cli.pets import set_pet_scale
-
-        scale, err = set_pet_scale(params.get("scale"))
-        if err:
-            return _err(rid, 4004, err)
-        return _ok(rid, {"ok": True, "scale": scale})
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("pet.scale failed: %s", exc)
-        return _err(rid, 5031, f"pet.scale failed: {exc}")
-
-
-@method("pet.cancel")
-def _(rid, params: dict) -> dict:
     """Signal an in-flight ``pet.generate``/``pet.hatch`` (by token) to stop.
 
     Best-effort + idempotent: cancelling an unknown/finished token is a no-op.
@@ -1896,150 +1799,6 @@ def _(rid, params: dict) -> dict:
 
 
 @method("pet.generate.status")
-def _(rid, params: dict) -> dict:
-    """Whether pet generation is possible right now.
-
-    True only when a reference-capable image backend (Nous Portal / OpenRouter /
-    OpenAI gpt-image) is configured — the desktop checks this on open so it can
-    offer setup instead of a dead prompt. Cheap (config + plugin discovery).
-    """
-    try:
-        from agent.pet.generate.imagegen import (
-            GenerationError,
-            list_sprite_providers,
-            resolve_provider,
-        )
-
-        try:
-            resolve_provider(require_references=True)
-            available = True
-        except GenerationError:
-            available = False
-        try:
-            providers = list_sprite_providers()
-        except Exception as exc:  # noqa: BLE001 - picker is best-effort
-            logger.debug("pet provider list failed: %s", exc)
-            providers = []
-        return _ok(rid, {"available": available, "providers": providers})
-    except Exception as exc:  # noqa: BLE001 - never break the surface
-        logger.debug("pet.generate.status failed: %s", exc)
-        return _ok(rid, {"available": False, "providers": []})
-
-
-@method("pet.generate")
-def _(rid, params: dict) -> dict:
-    """Generate candidate base looks for a new pet (the draft/variant step).
-
-    Params: ``prompt`` (required unless ``referenceImage`` is given), ``count``
-    (default 4), ``style`` (default ``auto``), ``referenceImage`` (optional data
-    URL — a user photo/reference every draft is grounded on, e.g. to make *their*
-    pet). Returns ``{ok, token, drafts:[{index, dataUri}]}`` — the token keys the
-    staged base images for a later ``pet.hatch``. Heavy (network): worker pool.
-    """
-    prompt = str(params.get("prompt") or "").strip()
-    ref_raw = str(params.get("referenceImage") or "").strip()
-    if not prompt and not ref_raw:
-        return _err(rid, 4004, "missing prompt")
-    try:
-        count = max(1, min(4, int(params.get("count") or 4)))
-    except (TypeError, ValueError):
-        count = 4
-    style = str(params.get("style") or "auto").strip() or "auto"
-
-    try:
-        import shutil
-        import uuid
-
-        from agent.pet.generate import generate_base_drafts
-        from agent.pet.generate.imagegen import GenerationError, resolve_provider
-
-        root = _pet_gen_root()
-        _pet_gen_sweep(root)
-
-        # Token up front so each draft can be staged + streamed the moment it
-        # lands, instead of the user staring at a blank grid until all N finish.
-        token = uuid.uuid4().hex[:12]
-        _pet_cancel_arm(token)
-        stage = root / token
-        stage.mkdir(parents=True, exist_ok=True)
-
-        reference_images = None
-        if ref_raw:
-            try:
-                reference_images = _pet_reference_images_from_data_url(ref_raw, stage)
-            except ValueError as exc:
-                _pet_cancel_release(token)
-                return _err(rid, 4004, str(exc))
-
-        # Optional desktop picker override: resolve the chosen provider up front so
-        # a bad/uncredentialed pick fails fast instead of mid-fan-out.
-        provider_name = str(params.get("provider") or "").strip()
-        sprite = None
-        if provider_name:
-            try:
-                sprite = resolve_provider(require_references=bool(reference_images), prefer=provider_name)
-            except GenerationError as exc:
-                _pet_cancel_release(token)
-                return _err(rid, 5031, str(exc))
-
-        concept = prompt or "a pet based on the reference image"
-        out: list[dict] = []
-
-        # Hand the token to the client up front (token-only init event) so a Stop
-        # fired before the first draft lands can still target this run.
-        try:
-            _emit("pet.generate.progress", "", {"token": token, "count": count})
-        except Exception as exc:  # noqa: BLE001 - streaming is best-effort
-            logger.debug("pet.generate init emit failed: %s", exc)
-
-        def _on_draft(index: int, src) -> None:
-            dest = stage / f"draft-{index}.png"
-            try:
-                shutil.copyfile(src, dest)
-                data_uri = _pet_png_data_uri(dest)
-            except Exception as exc:  # noqa: BLE001 - skip a bad draft, keep the rest
-                logger.debug("pet.generate draft %d failed: %s", index, exc)
-                return
-            out.append({"index": index, "dataUri": data_uri})
-            # Stream this draft to the client so the grid fills in live. Best-
-            # effort: a transport hiccup must not abort the generation itself.
-            try:
-                _emit(
-                    "pet.generate.progress",
-                    "",
-                    {"token": token, "index": index, "dataUri": data_uri, "count": count},
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("pet.generate progress emit failed: %s", exc)
-
-        try:
-            generate_base_drafts(
-                concept,
-                n=count,
-                style=style,
-                reference_images=reference_images,
-                provider=sprite,
-                on_draft=_on_draft,
-                is_cancelled=lambda: _pet_is_cancelled(token),
-            )
-        except GenerationError as exc:
-            _pet_cancel_release(token)
-            return _err(rid, 5031, str(exc))
-
-        cancelled = _pet_is_cancelled(token)
-        _pet_cancel_release(token)
-        if cancelled:
-            return _err(rid, 5031, "generation cancelled")
-        if not out:
-            return _err(rid, 5031, "generation produced no usable drafts")
-        out.sort(key=lambda d: d["index"])
-        return _ok(rid, {"ok": True, "token": token, "drafts": out})
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("pet.generate failed: %s", exc)
-        return _err(rid, 5031, f"pet.generate failed: {exc}")
-
-
-@method("pet.hatch")
 def _(rid, params: dict) -> dict:
     """Turn a chosen base draft into a full pet — installed but NOT yet active.
 
@@ -3027,9 +2786,6 @@ def _(rid, params: dict) -> dict:
 
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
-    # Keypress barge-in: stopping the turn also silences its streaming TTS
-    # (voice is process-global, so no per-session scoping is needed).
-    _tts_stream_stop()
     session, err = _sess_nowait(params, rid)
     if err:
         return err

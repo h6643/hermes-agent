@@ -466,7 +466,7 @@ async def select_toolset_provider(
 
     Delegates to ``apply_provider_selection`` — the shared, non-interactive
     core extracted from the CLI configurator — so the GUI and ``hermes tools``
-    write identical config keys (``web.backend``, ``tts.provider``, etc.).
+    write identical config keys (``web.backend``, ``stt.provider``, etc.).
     API keys and post-setup flows are handled by separate endpoints. Returns
     400 for unknown toolset or provider names.
 
