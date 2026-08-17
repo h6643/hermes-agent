@@ -51,8 +51,13 @@ class TestGuidanceConstants:
         assert "like a diary" not in MEMORY_GUIDANCE
         assert ">80%" not in MEMORY_GUIDANCE
 
-    def test_session_search_guidance_is_simple_cross_session_recall(self):
-        assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
+    def test_session_search_guidance_is_opt_in_recall(self):
+        assert "only by default" in SESSION_SEARCH_GUIDANCE
+        assert "禁止调用" in SESSION_SEARCH_GUIDANCE
+        assert "搜索历史" in SESSION_SEARCH_GUIDANCE
+        assert "查找之前" in SESSION_SEARCH_GUIDANCE
+        assert "current session" in SESSION_SEARCH_GUIDANCE
+        assert "relevant cross-session context exists" not in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
 

@@ -1205,6 +1205,75 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"row_id": int(row_id), "reactions": reactions})
 
 
+@method("message.delete")
+def _(rid, params: dict) -> dict:
+    """Permanently delete one message (and its enclosing turn) from a session.
+
+    Helix's frontend "撤回" (withdraw) targets the assistant reply the user is
+    hovering over. We delete that assistant message *plus* the user prompt that
+    preceded it (and any tool/tool-result rows in between) — i.e. the whole
+    turn — so the agent's context for the next prompt no longer contains it.
+
+    ``row_id`` is the durable ``messages.id`` (forwarded by the gateway's
+    ``message.complete`` frame). Accepts a single integer or a ``row_ids`` list
+    for batch deletes. Runs only when the session is idle (``session.running``
+    is false) — mirroring ``session.undo`` — so a live turn can't clobber the
+    deletion.
+
+    Persistence: hard-DELETE from ``state.db`` (via ``SessionDB.delete_message_and_turn``)
+    AND drop the same rows from the in-memory ``session["history"]`` (bumping
+    ``history_version``) so the next ``prompt.submit`` re-flush can't resurrect
+    them. Returns ``{"removed": <count>, "row_ids": [...]}``.
+    """
+    session, err = _sess(params, rid)
+    if err:
+        return err
+    if session.get("running"):
+        return _err(
+            rid, 4009, "session busy — /interrupt the current turn before message.delete"
+        )
+
+    raw = params.get("row_id")
+    if raw is None:
+        raw = params.get("row_ids")
+    if raw is None:
+        return _err(rid, 4023, "row_id (or row_ids) required")
+    if isinstance(raw, list):
+        try:
+            target_ids = [int(x) for x in raw]
+        except (TypeError, ValueError):
+            return _err(rid, 4023, "row_ids must be a list of integers")
+    else:
+        try:
+            target_ids = [int(raw)]
+        except (TypeError, ValueError):
+            return _err(rid, 4023, "row_id must be an integer")
+
+    session_key = session.get("session_key") or params.get("session_id")
+    total_removed = 0
+    deleted_row_ids: list = []
+    with session["history_lock"]:
+        with _session_db(session) as db:
+            if db is None:
+                return _db_unavailable_error(rid, code=5007)
+            for tid in target_ids:
+                ids = db.delete_message_and_turn(session_key, int(tid))
+                if ids:
+                    total_removed += len(ids)
+                    deleted_row_ids.extend(ids)
+        if deleted_row_ids:
+            drop = set(deleted_row_ids)
+            history = session.get("history", [])
+            new_history = [m for m in history if m.get("_row_id") not in drop]
+            if len(new_history) != len(history):
+                session["history"] = new_history
+                session["history_version"] = int(session.get("history_version", 0)) + 1
+
+    if total_removed == 0:
+        return _err(rid, 4040, "message not found in this session")
+    return _ok(rid, {"removed": total_removed, "row_ids": deleted_row_ids})
+
+
 @method("llm.oneshot")
 def _(rid, params: dict) -> dict:
     """Run a single stateless LLM request outside any conversation.
@@ -1449,23 +1518,10 @@ def _(rid, params: dict) -> dict:
         # local per-conversation store for the ring.
         return _ok(rid, {"categories": [], "context_max": 0, "context_used": 0, "context_percent": 0})
     try:
-        enabled, pet, scale = _pet_active_selection()
-
-        if not enabled or pet is None or not pet.exists:
-            return _ok(rid, {"enabled": False})
-
-        payload = {"enabled": True, **_pet_sprite_payload(pet, scale=scale)}
-
-        # Send-once semantics for the multi-MB spritesheet (#54730): a caller
-        # that already holds the sheet passes the revision it has, and an
-        # unchanged sheet comes back as metadata only (spritesheetUnchanged).
-        known_revision = str(params.get("knownRevision", "") or "")
-        if known_revision and known_revision == payload.get("spritesheetRevision"):
-            payload.pop("spritesheetBase64", None)
-            payload["spritesheetUnchanged"] = True
-
+        history = list(session.get("history", []))
+        payload = compute_session_context_breakdown(agent, history)
         return _ok(rid, payload)
-    except Exception as exc:  # noqa: BLE001 - cosmetic, never break the surface
+    except Exception as exc:  # noqa: BLE001 - never break the surface on measurement
         logger.warning("session.context_breakdown failed: %s", exc)
         return _ok(rid, {"categories": [], "context_max": 0, "context_used": 0, "context_percent": 0})
 

@@ -9387,6 +9387,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def get_last_message_row_id(self, session_id: str) -> Optional[int]:
+        """Return the most-recently-inserted message row id for *session_id*, or
+        ``None`` when the session has no messages.
+
+        Used by the gateway to surface the durable row id of a freshly completed
+        assistant turn so the desktop client can later target it for
+        ``message.delete`` (Helix frontend "撤回"/withdraw).
+        """
+        if not session_id:
+            return None
+        try:
+            with self._read_ctx() as conn:
+                row = conn.execute(
+                    "SELECT MAX(id) FROM messages WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                return int(row[0]) if row and row[0] is not None else None
+        except Exception:
+            return None
+
+    def delete_message_and_turn(
+        self, session_id: str, row_id: int
+    ) -> List[int]:
+        """Delete the message identified by *row_id* together with the whole
+        turn that precedes it: the nearest ``user`` message at or before
+        *row_id*, through *row_id* inclusive. This also removes any tool /
+        tool-result rows that sit between the user prompt and the targeted
+        message. Returns the list of deleted SQLite row ids (empty when the
+        target row does not exist in this session).
+
+        Used by the ``message.delete`` RPC (Helix frontend withdraw). Performs a
+        *hard* DELETE (not the ``active = 0`` soft-delete used by rewind) so the
+        message is truly gone from ``state.db`` and cannot be resurrected by a
+        later ``prompt.submit`` re-flush. ``sessions.message_count`` is
+        recomputed from the surviving active rows.
+        """
+        if not session_id or row_id is None:
+            return []
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, role FROM messages WHERE session_id = ? AND id = ?",
+                (session_id, row_id),
+            ).fetchone()
+            if row is None:
+                return []
+            start_id = row[0]
+            if row[1] != "user":
+                prev = conn.execute(
+                    "SELECT MAX(id) FROM messages WHERE session_id = ? AND id < ? AND role = 'user'",
+                    (session_id, start_id),
+                ).fetchone()
+                if prev and prev[0] is not None:
+                    start_id = prev[0]
+            ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND id >= ? AND id <= ?",
+                    (session_id, start_id, row_id),
+                ).fetchall()
+            ]
+            if not ids:
+                return []
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"DELETE FROM messages WHERE session_id = ? AND id IN ({placeholders})",
+                [session_id, *ids],
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = "
+                "(SELECT COUNT(*) FROM messages WHERE session_id = ? AND active = 1) "
+                "WHERE id = ?",
+                (session_id, session_id),
+            )
+            return ids
+
+        return self._execute_write(_do) or []
+
     def get_message_reactions(
         self, session_id: str, message_row_id: int
     ) -> List[Dict[str, Any]]:

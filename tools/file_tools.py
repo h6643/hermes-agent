@@ -1019,6 +1019,105 @@ def _check_approval_required_write(paths: list[str],
     return result.get("message") or blocked.format(why="was denied.")
 
 
+
+def _norm_approval_path(p: str) -> str:
+    r"""Normalize a path for workspace-boundary comparison.
+
+    Windows: strip the ``\\?\`` long-path prefix (terminal cwd records
+    arrive with it, resolved tool paths usually don't — comparing them
+    verbatim would never match), then normcase to fold drive-letter case
+    (NTFS is case-insensitive). POSIX: plain normpath keeps case-sensitive
+    semantics.
+    """
+    normed = os.path.normpath(p)
+    if sys.platform == "win32":
+        if normed.startswith("\\\\?\\UNC\\"):
+            normed = "\\\\" + normed[8:]
+        elif normed.startswith("\\\\?\\"):
+            normed = normed[4:]
+        normed = os.path.normcase(normed)
+    return normed
+
+
+def _check_approval_required_read(paths: list[str],
+                                  task_id: str = "default") -> str | None:
+    """Gate a read/search touching a path OUTSIDE the active workspace.
+
+    Reads inside the project root (the authoritative workspace root for the
+    task) are free and never hit this gate. Any absolute path outside that
+    root requires human approval: an agent silently pulling in files from
+    the wider machine is exactly the leak this prompt exists for.
+
+    The pattern key is ``read_file:outside_project:<resolved-path>`` — the
+    desktop UI's approval classifier matches this prefix and pops an
+    approval card (agent-flow-panel.tsx ``classifyApproval``), so
+    once/session approval persists per path via the standard cache.
+
+    Returns ``None`` when every target is inside the workspace or was
+    approved; otherwise a BLOCKED error string. Fail-closed when no
+    interactive/gateway channel exists (mirrors the write gate).
+    """
+    try:
+        workspace_root = _authoritative_workspace_root(task_id) or os.getcwd()
+    except Exception:
+        workspace_root = os.getcwd()
+    root_norm = _norm_approval_path(str(workspace_root))
+
+    outside: list[str] = []
+    for p in paths:
+        if not p:
+            continue
+        try:
+            resolved = str(Path(p).resolve())
+        except (OSError, ValueError):
+            resolved = str(p)
+        norm = _norm_approval_path(resolved)
+        if norm == root_norm or norm.startswith(root_norm + os.sep):
+            continue  # inside the workspace — free read
+        # Pseudo/special filesystems (proc/sys/dev) are already handled by
+        # get_read_block_error / the special-file guard; don't double-gate.
+        if norm.startswith(("/proc/", "/sys/", "/dev/")):
+            continue
+        outside.append(resolved)
+
+    if not outside:
+        return None
+
+    display_targets = ", ".join(dict.fromkeys(outside))
+    description = (
+        f"Agent is reading a path OUTSIDE the current project/workspace: "
+        f"{display_targets}. Reading project-external content requires "
+        f"your approval."
+    )
+    blocked = (
+        f"BLOCKED: reading project-external path(s) ({display_targets}) "
+        "{why} Do NOT retry it via another path (terminal, execute_code) "
+        "without the user's explicit consent."
+    )
+
+    try:
+        import tools.approval as _approval
+    except Exception:
+        return blocked.format(why="requires approval but the approval "
+                                  "subsystem is unavailable.")
+
+    result = _approval._run_approval_gate(
+        pattern_key="read_file:outside_project:" + display_targets,
+        description=description,
+        display_target=f"<read {display_targets}>",
+        cron_deny_message=blocked.format(
+            why="requires approval but this cron session denies it."),
+        autoapprove_log_prefix="read_file_outside_project",
+        fail_closed_when_no_human=True,
+        no_human_block_message=blocked.format(
+            why="requires approval but no interactive user or gateway is "
+                "present to approve it."),
+    )
+    if result.get("approved"):
+        return None
+    return result.get("message") or blocked.format(why="was denied.")
+
+
 def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | None:
     """Return the container-side Hermes mirror prefix for Docker file tools."""
     try:
@@ -1637,6 +1736,15 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             )
 
         _resolved = _resolve_path_for_task(path, task_id)
+
+        # ── Project-boundary approval gate ──────────────────────────────────────────────────
+        # Reading OUTSIDE the active workspace needs human approval
+        # (pattern_key read_file:outside_project:* — the desktop UI's
+        # classifier pops an approval card for this prefix). Reads
+        # inside the workspace are free and never hit this gate.
+        approval_err = _check_approval_required_read([str(_resolved)], task_id)
+        if approval_err:
+            return tool_error(approval_err)
 
         # ── Special-file type guard (stat-based) ──────────────────────
         # The name blocklist above catches /dev/* and /proc/* aliases; this
@@ -2576,6 +2684,13 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
+        # ── Project-boundary approval gate ───────────────────────────────────────────────────────────────────────
+        # Searching a directory OUTSIDE the workspace requires approval.
+        if resolved_path is not None:
+            approval_err = _check_approval_required_read([str(resolved_path)], task_id)
+            if approval_err:
+                return tool_error(approval_err)
+
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return tool_error(block_error)

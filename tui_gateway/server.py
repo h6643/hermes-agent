@@ -10909,6 +10909,30 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
+            # Surface the durable row id of the just-completed assistant turn so
+            # the desktop client can later target it for `message.delete`
+            # (Helix frontend "撤回"/withdraw). The row id is the SQLite
+            # `messages.id`. Prefer the in-memory history stamp (set when the
+            # turn was flushed to state.db); fall back to a direct DB lookup of
+            # the most-recent message for this session.
+            _row_id = None
+            for _m in reversed(session.get("history") or []):
+                if _m.get("role") == "assistant":
+                    _rid = _m.get("_row_id")
+                    if _rid is not None:
+                        _row_id = _rid
+                    break
+            if _row_id is None:
+                try:
+                    with _session_db(session) as _db:
+                        if _db is not None:
+                            _row_id = _db.get_last_message_row_id(
+                                session.get("session_key") or sid
+                            )
+                except Exception:
+                    _row_id = None
+            if _row_id is not None:
+                payload["row_id"] = _row_id
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
