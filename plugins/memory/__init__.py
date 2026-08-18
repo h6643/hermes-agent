@@ -128,6 +128,7 @@ def _iter_provider_dirs() -> List[Tuple[str, Path]]:
     precedence on name collisions (first-seen wins via ``seen`` set).
     """
     dirs: List[Tuple[str, Path]] = []
+    seen: set[str] = set()
 
     # 1. Bundled providers (plugins/memory/<name>/)
     if _MEMORY_PLUGINS_DIR.is_dir():
